@@ -1,5 +1,6 @@
 use std::borrow::Cow;
 
+use lazy_regex::Regex;
 use oxc_ast::{
     AstKind,
     ast::{TSInterfaceDeclaration, TSTypeLiteral},
@@ -30,8 +31,8 @@ pub struct NoEmptyObjectTypeConfig {
     allow_interfaces: AllowInterfaces,
     /** Whether to allow empty object type literals. */
     allow_object_types: AllowObjectTypes,
-    /** allow interfaces and object type aliases with the configured name */
-    allow_with_name: String,
+    /** allow interfaces and object type aliases with names matching the configured regex pattern */
+    allow_with_name: Option<Regex>,
 }
 
 impl std::ops::Deref for NoEmptyObjectType {
@@ -93,7 +94,7 @@ declare_oxc_lint!(
 impl Rule for NoEmptyObjectType {
     fn from_configuration(value: serde_json::Value) -> Self {
         let (allow_interfaces, allow_object_types, allow_with_name) = value.get(0).map_or(
-            (AllowInterfaces::Never, AllowObjectTypes::Never, String::default()),
+            (AllowInterfaces::Never, AllowObjectTypes::Never, None),
             |config| {
                 (
                     config
@@ -109,8 +110,7 @@ impl Rule for NoEmptyObjectType {
                     config
                         .get("allowWithName")
                         .and_then(serde_json::Value::as_str)
-                        .map(String::from)
-                        .unwrap_or_default(),
+                        .and_then(|s| Regex::new(s).ok()),
                 )
             },
         );
@@ -153,13 +153,15 @@ fn check_interface_declaration(
     ctx: &LintContext,
     interface: &TSInterfaceDeclaration,
     allow_interfaces: AllowInterfaces,
-    allow_with_name: &str,
+    allow_with_name: &Option<Regex>,
 ) {
     if allow_interfaces == AllowInterfaces::Always {
         return;
     }
-    if interface.id.name.as_str() == allow_with_name {
-        return;
+    if let Some(regex) = allow_with_name {
+        if regex.is_match(interface.id.name.as_str()) {
+            return;
+        }
     }
     if interface.extends.is_empty()
         || (allow_interfaces == AllowInterfaces::Never && interface.extends.len() == 1)
@@ -176,7 +178,7 @@ fn check_type_literal(
     type_literal: &TSTypeLiteral,
     node_id: NodeId,
     allow_object_types: AllowObjectTypes,
-    allow_with_name: &str,
+    allow_with_name: &Option<Regex>,
 ) {
     if matches!(allow_object_types, AllowObjectTypes::Always) {
         return;
@@ -184,8 +186,10 @@ fn check_type_literal(
     match ctx.nodes().parent_kind(node_id) {
         AstKind::TSIntersectionType(_) => return,
         AstKind::TSTypeAliasDeclaration(alias) => {
-            if alias.id.name.as_str() == allow_with_name {
-                return;
+            if let Some(regex) = allow_with_name {
+                if regex.is_match(alias.id.name.as_str()) {
+                    return;
+                }
             }
         }
         _ => (),
@@ -290,6 +294,15 @@ fn test() {
         ("type BaseProps = {};", Some(serde_json::json!([{ "allowWithName": "BaseProps" }]))),
         ("interface Base {}", Some(serde_json::json!([{ "allowWithName": "Base" }]))),
         ("interface BaseProps {}", Some(serde_json::json!([{ "allowWithName": "BaseProps" }]))),
+        // Regex pattern tests
+        ("type FooProps = {};", Some(serde_json::json!([{ "allowWithName": "Props$" }]))),
+        ("interface BarProps {}", Some(serde_json::json!([{ "allowWithName": "Props$" }]))),
+        ("type MyComponentProps = {};", Some(serde_json::json!([{ "allowWithName": "Props$" }]))),
+        ("type BaseConfig = {};", Some(serde_json::json!([{ "allowWithName": "^Base" }]))),
+        ("interface BaseInterface {}", Some(serde_json::json!([{ "allowWithName": "^Base" }]))),
+        ("type BaseFoo = {};", Some(serde_json::json!([{ "allowWithName": "^Base" }]))),
+        ("type FooBarBaz = {};", Some(serde_json::json!([{ "allowWithName": "Foo.*Baz" }]))),
+        ("interface FooXYZBaz {}", Some(serde_json::json!([{ "allowWithName": "Foo.*Baz" }]))),
     ];
 
     let fail = vec![
@@ -385,6 +398,11 @@ fn test() {
         ("type Base = {} | null;", Some(serde_json::json!([{ "allowWithName": "Base" }]))),
         ("type Base = {};", Some(serde_json::json!([{ "allowWithName": "Mismatch" }]))),
         ("interface Base {}", Some(serde_json::json!([{ "allowWithName": "Props" }]))),
+        // Regex pattern tests that should fail
+        ("type Foo = {};", Some(serde_json::json!([{ "allowWithName": "Props$" }]))),
+        ("interface Bar {}", Some(serde_json::json!([{ "allowWithName": "Props$" }]))),
+        ("type Config = {};", Some(serde_json::json!([{ "allowWithName": "^Base" }]))),
+        ("interface NotBase {}", Some(serde_json::json!([{ "allowWithName": "^Base" }]))),
     ];
 
     Tester::new(NoEmptyObjectType::NAME, NoEmptyObjectType::PLUGIN, pass, fail).test_and_snapshot();

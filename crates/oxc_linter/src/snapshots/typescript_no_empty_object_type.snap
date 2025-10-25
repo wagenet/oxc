@@ -171,3 +171,31 @@ source: crates/oxc_linter/src/tester.rs
    ·                ──
    ╰────
   help: To avoid confusion around the {} type allowing any non-nullish value, this rule bans usage of the {} type.
+
+  ⚠ typescript-eslint(no-empty-object-type): Do not use the empty object type literal.
+   ╭─[no_empty_object_type.tsx:1:12]
+ 1 │ type Foo = {};
+   ·            ──
+   ╰────
+  help: To avoid confusion around the {} type allowing any non-nullish value, this rule bans usage of the {} type.
+
+  ⚠ typescript-eslint(no-empty-object-type): Do not use an empty interface declaration.
+   ╭─[no_empty_object_type.tsx:1:15]
+ 1 │ interface Bar {}
+   ·               ──
+   ╰────
+  help: To avoid confusion around the {} type allowing any non-nullish value, this rule bans usage of the {} type.
+
+  ⚠ typescript-eslint(no-empty-object-type): Do not use the empty object type literal.
+   ╭─[no_empty_object_type.tsx:1:15]
+ 1 │ type Config = {};
+   ·               ──
+   ╰────
+  help: To avoid confusion around the {} type allowing any non-nullish value, this rule bans usage of the {} type.
+
+  ⚠ typescript-eslint(no-empty-object-type): Do not use an empty interface declaration.
+   ╭─[no_empty_object_type.tsx:1:19]
+ 1 │ interface NotBase {}
+   ·                   ──
+   ╰────
+  help: To avoid confusion around the {} type allowing any non-nullish value, this rule bans usage of the {} type.
