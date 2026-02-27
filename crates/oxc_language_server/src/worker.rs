@@ -870,4 +870,107 @@ mod tests {
 
         assert_eq!(error, "Fake diagnostic error");
     }
+
+    /// Verify that `handle_tool_changes` releases the `tools` write lock before running
+    /// per-file diagnostics in Phase 2, so that concurrent read-only operations such as
+    /// `get_code_actions_or_commands` are not blocked for the full duration of the diagnostic
+    /// re-run.
+    ///
+    /// The test uses a [`BlockingFakeTool`] whose `run_diagnostic` blocks inside
+    /// `tokio::task::block_in_place` until a [`ToolGate`] is opened.
+    ///
+    /// Sequence:
+    /// 1. Arm the gate (so the next `run_diagnostic` call will block).
+    /// 2. Spawn `did_change_watched_files` (triggers Phase 1 + Phase 2).
+    ///    Phase 1 acquires `tools.write()`, replaces the tool, then **releases** the write lock.
+    ///    Phase 2 acquires `tools.read()` and calls `run_diagnostic`, which blocks.
+    /// 3. Wait for the "started" signal from `run_diagnostic`.
+    /// 4. Call `get_code_actions_or_commands` while Phase 2 is still blocking.
+    ///    It must also acquire `tools.read()`.  Because multiple readers can hold the lock
+    ///    concurrently, the call must complete without deadlock.
+    ///    With the old code (write lock held throughout Phase 2) this call would have been
+    ///    blocked indefinitely.
+    /// 5. Open the gate and join the spawned task.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_write_lock_released_before_phase_2_diagnostics() {
+        use std::{sync::Arc, time::Duration};
+
+        use tokio::time::timeout;
+
+        use crate::tests::{BlockingFakeToolBuilder, ToolGate};
+
+        let gate = Arc::new(ToolGate::new()); // starts open: initial build_boxed calls complete
+
+        let worker = Arc::new(WorkspaceWorker::new(
+            Uri::from_str("file:///root/").unwrap(),
+            Arc::new([
+                Box::new(BlockingFakeToolBuilder::new(DiagnosticMode::None, gate.clone()))
+                    as Box<dyn ToolBuilder>,
+            ]),
+            DiagnosticMode::None,
+        ));
+        worker.start_worker(serde_json::Value::Null).await;
+
+        // Open a file so that Phase 2 has at least one URI to iterate over.
+        let fs = Arc::new(LSPFileSystem::default());
+        fs.set(
+            Uri::from_str("file:///root/diagnostics.config").unwrap(),
+            "test content".to_string(),
+        );
+
+        // Arm the gate: the next run_diagnostic call will send a signal then block.
+        let started_rx = gate.arm();
+
+        // Spawn a task that triggers Phase 2 via a watched-file change.
+        let worker1 = worker.clone();
+        let fs1 = fs.clone();
+        let task1 = tokio::spawn(async move {
+            let fs_ref = &*fs1;
+            let mut needs_refresh = false;
+            worker1
+                .did_change_watched_files(
+                    &FileEvent {
+                        uri: Uri::from_str("file:///root/tool.config").unwrap(),
+                        typ: FileChangeType::CHANGED,
+                    },
+                    &mut needs_refresh,
+                    Some(fs_ref),
+                )
+                .await
+        });
+
+        // Wait for Phase 2 to start (run_diagnostic is now blocking via block_in_place).
+        timeout(Duration::from_secs(5), started_rx)
+            .await
+            .expect("timed out waiting for Phase 2 run_diagnostic to start")
+            .expect("started_rx was dropped");
+
+        // Phase 2 holds tools.read() while blocking.  get_code_actions_or_commands also needs
+        // tools.read().  With the old code (tools.write() held throughout Phase 2) this would
+        // deadlock.  With the fix (tools.read() in Phase 2) both readers can proceed.
+        let actions = timeout(
+            Duration::from_secs(2),
+            worker.get_code_actions_or_commands(
+                &Uri::from_str("file:///root/code_action.config").unwrap(),
+                &Range::default(),
+                None,
+            ),
+        )
+        .await
+        .expect(
+            "get_code_actions_or_commands was blocked/deadlocked by handle_tool_changes \
+             (write lock not released before Phase 2)",
+        );
+        // The actual code-action content is not what we are testing here.
+        let _ = actions;
+
+        // Unblock Phase 2.
+        gate.open();
+
+        // Verify Phase 2 completed successfully.
+        timeout(Duration::from_secs(5), task1)
+            .await
+            .expect("handle_tool_changes did not complete after gate was opened")
+            .expect("did_change_watched_files task panicked");
+    }
 }

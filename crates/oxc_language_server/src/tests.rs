@@ -1,4 +1,7 @@
-use std::collections::VecDeque;
+use std::{
+    collections::VecDeque,
+    sync::{Arc, Condvar, Mutex},
+};
 
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
@@ -179,6 +182,169 @@ impl Tool for FakeTool {
 
     fn run_diagnostic_on_save(&self, uri: &Uri, content: Option<&str>) -> DiagnosticResult {
         // For this fake tool, we use the same logic as run_diagnostic
+        self.run_diagnostic(uri, content)
+    }
+}
+
+/// A gate used to synchronise `BlockingFakeTool::run_diagnostic` with the test task.
+///
+/// The gate starts **open** so that diagnostic calls during test setup complete immediately.
+/// Call [`ToolGate::arm`] to close the gate before the action under test; the next call to
+/// `run_diagnostic` will send a one-shot signal (so the test knows Phase 2 has started) and
+/// then block until [`ToolGate::open`] is called.
+pub struct ToolGate {
+    inner: Mutex<ToolGateInner>,
+    cvar: Condvar,
+}
+
+struct ToolGateInner {
+    open: bool,
+    started_tx: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+impl ToolGate {
+    pub fn new() -> Self {
+        Self {
+            inner: Mutex::new(ToolGateInner { open: true, started_tx: None }),
+            cvar: Condvar::new(),
+        }
+    }
+
+    /// Close the gate and return a receiver that fires when `run_diagnostic` first enters its
+    /// blocking wait.  The gate must be re-opened afterwards with [`ToolGate::open`].
+    pub fn arm(&self) -> tokio::sync::oneshot::Receiver<()> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let mut inner = self.inner.lock().unwrap();
+        inner.open = false;
+        inner.started_tx = Some(tx);
+        rx
+    }
+
+    /// Unblock any `run_diagnostic` call that is currently waiting.
+    pub fn open(&self) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.open = true;
+        drop(inner);
+        self.cvar.notify_all();
+    }
+
+    /// Called from within `run_diagnostic`.  Signals that the diagnostic has started, then
+    /// blocks until the gate is opened.
+    fn wait(&self) {
+        let mut inner = self.inner.lock().unwrap();
+        if let Some(tx) = inner.started_tx.take() {
+            let _ = tx.send(());
+        }
+        while !inner.open {
+            inner = self.cvar.wait(inner).unwrap();
+        }
+    }
+}
+
+/// A [`ToolBuilder`] whose tool blocks in `run_diagnostic` until a [`ToolGate`] is opened.
+/// This is used to test that `handle_tool_changes` releases the write lock before running
+/// per-file diagnostics (Phase 2), so that concurrent requests such as `codeAction` are not
+/// blocked.
+pub struct BlockingFakeToolBuilder {
+    gate: Arc<ToolGate>,
+    diagnostic_mode: DiagnosticMode,
+}
+
+impl BlockingFakeToolBuilder {
+    pub fn new(diagnostic_mode: DiagnosticMode, gate: Arc<ToolGate>) -> Self {
+        Self { gate, diagnostic_mode }
+    }
+}
+
+impl ToolBuilder for BlockingFakeToolBuilder {
+    fn build_boxed(&self, _root_uri: &Uri, _options: serde_json::Value) -> Box<dyn Tool> {
+        Box::new(BlockingFakeTool { gate: self.gate.clone() })
+    }
+
+    fn server_capabilities(
+        &self,
+        capabilities: &mut ServerCapabilities,
+        backend_capabilities: &mut crate::Capabilities,
+    ) {
+        backend_capabilities.diagnostic_mode = self.diagnostic_mode.clone();
+        capabilities.diagnostic_provider =
+            if backend_capabilities.diagnostic_mode == DiagnosticMode::Pull {
+                Some(DiagnosticServerCapabilities::Options(DiagnosticOptions::default()))
+            } else {
+                None
+            };
+    }
+}
+
+pub struct BlockingFakeTool {
+    gate: Arc<ToolGate>,
+}
+
+impl Tool for BlockingFakeTool {
+    fn name(&self) -> &'static str {
+        "BlockingFakeTool"
+    }
+
+    fn handle_configuration_change(
+        &self,
+        _builder: &dyn ToolBuilder,
+        _root_uri: &Uri,
+        _old_options_json: &serde_json::Value,
+        _new_options_json: serde_json::Value,
+    ) -> ToolRestartChanges {
+        ToolRestartChanges { tool: None, watch_patterns: None }
+    }
+
+    fn get_watcher_patterns(
+        &self,
+        options: serde_json::Value,
+    ) -> Vec<tower_lsp_server::ls_types::Pattern> {
+        if !matches!(options, serde_json::Value::Null) {
+            return vec![];
+        }
+        vec!["**/fake.config".to_string()]
+    }
+
+    fn handle_watched_file_change(
+        &self,
+        builder: &dyn ToolBuilder,
+        changed_uri: &Uri,
+        root_uri: &Uri,
+        options: serde_json::Value,
+    ) -> ToolRestartChanges {
+        if changed_uri.as_str().ends_with("tool.config") {
+            return ToolRestartChanges {
+                tool: Some(builder.build_boxed(root_uri, options)),
+                watch_patterns: None,
+            };
+        }
+        ToolRestartChanges { tool: None, watch_patterns: None }
+    }
+
+    fn run_diagnostic(&self, uri: &Uri, content: Option<&str>) -> DiagnosticResult {
+        // Use block_in_place so tokio can keep running other tasks while this thread
+        // waits for the gate (simulating a slow synchronous diagnostic).
+        tokio::task::block_in_place(|| self.gate.wait());
+        if uri.as_str().ends_with("diagnostics.config") {
+            return Ok(vec![(
+                uri.clone(),
+                vec![Diagnostic {
+                    message: format!(
+                        "Fake diagnostic for content: {}",
+                        content.unwrap_or("<no content>")
+                    ),
+                    ..Default::default()
+                }],
+            )]);
+        }
+        Ok(Vec::new())
+    }
+
+    fn run_diagnostic_on_change(&self, uri: &Uri, content: Option<&str>) -> DiagnosticResult {
+        self.run_diagnostic(uri, content)
+    }
+
+    fn run_diagnostic_on_save(&self, uri: &Uri, content: Option<&str>) -> DiagnosticResult {
         self.run_diagnostic(uri, content)
     }
 }
