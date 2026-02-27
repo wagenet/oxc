@@ -903,10 +903,8 @@ mod tests {
 
         let worker = Arc::new(WorkspaceWorker::new(
             Uri::from_str("file:///root/").unwrap(),
-            Arc::new([
-                Box::new(BlockingFakeToolBuilder::new(DiagnosticMode::None, gate.clone()))
-                    as Box<dyn ToolBuilder>,
-            ]),
+            Arc::new([Box::new(BlockingFakeToolBuilder::new(DiagnosticMode::None, gate.clone()))
+                as Box<dyn ToolBuilder>]),
             DiagnosticMode::None,
         ));
         worker.start_worker(serde_json::Value::Null).await;
