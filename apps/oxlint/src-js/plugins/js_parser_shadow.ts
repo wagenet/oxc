@@ -48,10 +48,6 @@ export interface MaskedRegionReport {
   refs: string[];
 }
 
-// Cap on number of injected refs per region, to bound the work Rust does fitting them
-// into the placeholder. Real-world templates reference far fewer variables than this.
-const MAX_REFS_PER_REGION = 64;
-
 // Valid JS identifier that can be injected into a placeholder without breaking its syntax.
 // Matches the full ECMAScript identifier grammar (including non-ASCII identifiers, e.g. a
 // component named `café`), so unicode component names referenced only inside custom syntax
@@ -178,7 +174,6 @@ export function setParentsAndGetMaskedRegions(
     for (const name of privateNames) {
       // Validate the private field name is a plain identifier, same as `collectRefs`
       if (!INJECTABLE_IDENT_REGEX.test(name)) continue;
-      if (region.refs.length >= MAX_REFS_PER_REGION) break;
       // Only inject if a class enclosing the region declares `#name` - otherwise the
       // shadow source would reference a private name that doesn't exist in it, which
       // is a parse error (killing native linting for the whole file).
@@ -238,7 +233,7 @@ function detectInjectables(
       usesThis = true;
     } else if (type === "PrivateIdentifier") {
       const { name } = node as { name?: unknown };
-      if (typeof name === "string" && privateNames.size < MAX_REFS_PER_REGION) {
+      if (typeof name === "string") {
         privateNames.add(name);
       }
     }
@@ -364,7 +359,7 @@ function collectRefs(regions: MaskedRegionReport[], scopeManager: JsParserScopeM
       const region = regions[regionIndex];
       let seen = seenNames[regionIndex];
       if (seen === null) seen = seenNames[regionIndex] = new Set();
-      if (seen.has(name) || seen.size >= MAX_REFS_PER_REGION) continue;
+      if (seen.has(name)) continue;
 
       // Only inject variables declared outside all masked regions. A variable declared
       // inside a region (e.g. an Ember template block param `as |item|`) does not exist
