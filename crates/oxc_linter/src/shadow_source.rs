@@ -7,7 +7,7 @@
 //! region", reported from JS side) replaced in-place by a valid JS placeholder of the
 //! same byte length:
 //!
-//! - Expression position: a template literal `` ` ` `` filled with whitespace.
+//! - Expression position: `void` and a template literal `` ` ` `` filled with whitespace.
 //! - Class element position (parent is a `ClassBody`): a `static { }` block,
 //!   or pure whitespace if the region is too short for one.
 //!
@@ -57,6 +57,9 @@ pub struct MaskedRegion {
 
 /// Byte length of `static{` + `}`
 const STATIC_BLOCK_DELIMS_LEN: usize = 8;
+
+/// Written before an expression-position template literal (see `write_placeholder`)
+const VOID_PREFIX: &[u8] = b"void ";
 
 /// Build the shadow source for `source_text` with the given masked regions.
 ///
@@ -143,6 +146,20 @@ fn write_placeholder(out: &mut Vec<u8>, original: &[u8], region: &MaskedRegion) 
             placeholder[open] = b'0';
             return;
         }
+        // No ASI happens before a backtick, so a literal opening the line after an unterminated
+        // statement (`const f = () => g()` + newline + `<template>`) would continue it as a
+        // tagged template. `void` cannot continue an expression, so ASI ends the statement,
+        // and `void` + literal is still one expression wherever the template could stand.
+        let open = if close - open > VOID_PREFIX.len()
+            && !placeholder[open..open + VOID_PREFIX.len()]
+                .iter()
+                .any(|&b| b == b'\n' || b == b'\r')
+        {
+            placeholder[open..open + VOID_PREFIX.len()].copy_from_slice(VOID_PREFIX);
+            open + VOID_PREFIX.len()
+        } else {
+            open
+        };
         placeholder[open] = b'`';
         placeholder[close] = b'`';
         inject_refs(&mut placeholder[open + 1..close], &region.refs, RefStyle::Interpolation);
@@ -239,8 +256,24 @@ mod tests {
         let end = source.rfind('>').unwrap() as u32 + 1;
         let shadow = build_shadow_source(source, &[region(start, end, false, &[])]).unwrap();
         assert_eq!(shadow.len(), source.len());
-        let expected = format!("const t = `{}`;\n", " ".repeat((end - start) as usize - 2));
+        let expected = format!("const t = void `{}`;\n", " ".repeat((end - start) as usize - 7));
         assert_eq!(shadow, expected);
+    }
+
+    #[test]
+    fn expression_placeholder_does_not_continue_previous_line() {
+        // No ASI happens before a backtick: if the placeholder starts with one, the previous
+        // line takes it as a tagged template, and `make`'s only use lands in its own initializer.
+        let source = "const make = () => g()\n\n<template>{{make}}</template>\n";
+        let start = source.find('<').unwrap() as u32;
+        let end = source.rfind('>').unwrap() as u32 + 1;
+        let shadow = build_shadow_source(source, &[region(start, end, false, &["make"])]).unwrap();
+        assert_eq!(shadow.len(), source.len());
+
+        let allocator = oxc_allocator::Allocator::default();
+        let ret = oxc_parser::Parser::new(&allocator, &shadow, oxc_span::SourceType::mjs()).parse();
+        assert!(ret.diagnostics.is_empty(), "{shadow:?}");
+        assert_eq!(ret.program.body.len(), 2, "{shadow:?}");
     }
 
     #[test]
@@ -270,7 +303,7 @@ mod tests {
                 assert_eq!(shadow.as_bytes()[i], b'\n');
             }
         }
-        assert!(shadow.starts_with("x(`"));
+        assert!(shadow.starts_with("x(void `"));
         assert!(shadow.ends_with("`);\n"));
     }
 
@@ -284,7 +317,7 @@ mod tests {
         assert_eq!(shadow.len(), source.len());
         assert!(shadow.contains("${foo}"));
         assert!(shadow.contains("${bar}"));
-        assert!(shadow.starts_with("const t = `"));
+        assert!(shadow.starts_with("const t = void `"));
         assert!(shadow.ends_with("`;\n"));
     }
 
@@ -362,7 +395,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(shadow.len(), source.len());
-        let mask = format!("`{}`", " ".repeat("<t>x</t>".len() - 2));
+        let mask = format!("void `{}`", " ".repeat("<t>x</t>".len() - 7));
         assert_eq!(shadow, format!("const a = {mask};\nconst b = {mask};\n"));
     }
 
@@ -402,7 +435,7 @@ mod tests {
         let shadow = build_shadow_source(source, &[region(start, end, false, &[])]).unwrap();
         assert_eq!(shadow.len(), source.len());
         assert_eq!(shadow.as_bytes()[start as usize], b'\n');
-        assert!(shadow.starts_with("x(\n`"));
+        assert!(shadow.starts_with("x(\nvoid `"));
         assert!(shadow.ends_with("`);\n"));
     }
 
@@ -415,7 +448,7 @@ mod tests {
         let shadow = build_shadow_source(source, &[region(start, end, false, &[])]).unwrap();
         assert_eq!(shadow.len(), source.len());
         assert_eq!(shadow.as_bytes()[(end - 1) as usize], b'\n');
-        assert!(shadow.starts_with("x(`"));
+        assert!(shadow.starts_with("x(void `"));
         assert!(shadow.ends_with("`\n);\n"));
     }
 
