@@ -244,6 +244,22 @@ mod tests {
     }
 
     #[test]
+    fn expression_placeholder_does_not_continue_previous_line() {
+        // No ASI happens before a backtick: if the placeholder starts with one, the previous
+        // line takes it as a tagged template, and `make`'s only use lands in its own initializer.
+        let source = "const make = () => g()\n\n<template>{{make}}</template>\n";
+        let start = source.find('<').unwrap() as u32;
+        let end = source.rfind('>').unwrap() as u32 + 1;
+        let shadow = build_shadow_source(source, &[region(start, end, false, &["make"])]).unwrap();
+        assert_eq!(shadow.len(), source.len());
+
+        let allocator = oxc_allocator::Allocator::default();
+        let ret = oxc_parser::Parser::new(&allocator, &shadow, oxc_span::SourceType::mjs()).parse();
+        assert!(ret.diagnostics.is_empty(), "{shadow:?}");
+        assert_eq!(ret.program.body.len(), 2, "{shadow:?}");
+    }
+
+    #[test]
     fn class_member_becomes_static_block() {
         let source = "class A {\n  <template>hi</template>\n}\n";
         let start = source.find('<').unwrap() as u32;
